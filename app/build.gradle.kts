@@ -46,6 +46,29 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        resValues = true
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    packaging {
+        resources {
+            // Exclude conflicting licenses and duplicate meta files from GraphHopper's transitive dependencies
+            excludes += setOf(
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/license.txt",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt",
+                "META-INF/notice.txt",
+                "META-INF/ASL2.0",
+                "META-INF/*.kotlin_module"
+            )
+        }
     }
 }
 
@@ -63,6 +86,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 // MapLibre Turf for polyline decoding & geometry handling
     implementation("org.maplibre.gl:android-sdk-turf:5.9.0")
+    implementation("com.graphhopper:graphhopper-core:0.13.0")
+
+    // Android SLF4J binding (prevents "SLF4J: Failed to load class StaticLoggerBinder" runtime crash)
+    implementation("org.slf4j:slf4j-android:1.7.36")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

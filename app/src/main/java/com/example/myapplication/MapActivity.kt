@@ -20,10 +20,11 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import com.graphhopper.GHRequest
+import com.graphhopper.GHResponse
+import com.graphhopper.GraphHopper
+import com.graphhopper.util.shapes.GHPoint
 import fi.iki.elonen.NanoHTTPD
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONObject
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -43,11 +44,10 @@ import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
 import org.maplibre.geojson.Point
-import org.maplibre.geojson.utils.PolylineUtils
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.net.URLEncoder
+import java.util.zip.ZipInputStream
 
 class MapActivity : ComponentActivity() {
 
@@ -57,7 +57,10 @@ class MapActivity : ComponentActivity() {
 
     private var mapLibreMap: MapLibreMap? = null
     private var tileServer: MbtilesServer? = null
-    private val httpClient = OkHttpClient()
+
+    // Embedded Offline Routing Engine
+    private var hopper: GraphHopper? = null
+    private var isHopperReady = false
 
     private val ROUTE_SOURCE_ID = "route-source-id"
     private val ROUTE_LAYER_ID = "route-layer-id"
@@ -65,10 +68,8 @@ class MapActivity : ComponentActivity() {
     private val DEST_LAYER_ID = "dest-marker-layer-id"
     private val DEST_ICON_ID = "dest-pin-icon"
 
-    // Fallback origin: Chennai Central (13.0827, 80.2707)
     private val fallbackStart = LatLng(13.0827, 80.2707)
 
-    // Permission launcher for runtime GPS requests
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -91,33 +92,34 @@ class MapActivity : ComponentActivity() {
         etDestination = findViewById(R.id.etDestination)
 
         findViewById<Button>(R.id.btnBack).setOnClickListener { finish() }
-
-        // Clear active route and destination marker
-        findViewById<Button>(R.id.btnClear).setOnClickListener {
-            clearRouteAndMarker()
-        }
-
-        // Center camera on current GPS location
-        findViewById<Button>(R.id.btnGps).setOnClickListener {
-            centerOnUserLocation()
-        }
-
-        // Handle search button click
+        findViewById<Button>(R.id.btnClear).setOnClickListener { clearRouteAndMarker() }
+        findViewById<Button>(R.id.btnGps).setOnClickListener { centerOnUserLocation() }
         findViewById<Button>(R.id.btnSearch).setOnClickListener {
-            triggerSearch()
-        }
+            hideKeyboard()
+            val text = etDestination.text.toString().trim()
+            if (text.isEmpty()) {
+                Toast.makeText(this, "Select a destination first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
 
-        // Handle keyboard "Search" action
-        etDestination.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                triggerSearch()
-                true
-            } else {
-                false
+            try {
+                val parts = text.split(",").map { it.trim().toDouble() }
+                if (parts.size == 2) {
+                    val target = LatLng(parts[0], parts[1])
+                    setDestinationAndRoute(target)
+                } else {
+                    Toast.makeText(this, "Enter valid coordinates: lat, lon", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Coordinate parse error: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
+        // Start Tile Server & Init Engine in Background
+        initOfflineTileServer()
+        initOfflineGraphHopper()
+    }
 
-        // Start offline tile server on background thread
+    private fun initOfflineTileServer() {
         Thread {
             try {
                 val mbtilesFile = File(filesDir, "chennai.mbtiles")
@@ -140,17 +142,15 @@ class MapActivity : ComponentActivity() {
                             .zoom(12.5)
                             .build()
 
-                        // Load vector style directly from JSON string
                         map.setStyle(Style.Builder().fromJson(server.styleJson)) { style ->
                             initLayers(style)
                             checkLocationPermissionsAndEnable(style)
                         }
 
-                        // Map click listener: drop marker and calculate route
                         map.addOnMapClickListener { targetLatLng ->
                             hideKeyboard()
                             etDestination.setText("%.4f, %.4f".format(targetLatLng.latitude, targetLatLng.longitude))
-                            setDestinationAndRoute(targetLatLng, "Tapped Location")
+                            setDestinationAndRoute(targetLatLng)
                             true
                         }
                     }
@@ -163,13 +163,142 @@ class MapActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun triggerSearch() {
-        hideKeyboard()
-        val query = etDestination.text.toString().trim()
-        if (query.isNotEmpty()) {
-            geocodeAndRoute(query)
+    private fun initOfflineGraphHopper() {
+        Thread {
+            try {
+                val graphFolder = File(filesDir, "chennai-gh-car")
+
+                // Extract zip from assets if not yet extracted
+                if (!graphFolder.exists() || graphFolder.list().isNullOrEmpty()) {
+                    runOnUiThread { tvStatus.text = "Extracting offline routing data..." }
+                    graphFolder.mkdirs()
+                    unzipFromAssets("chennai-gh-car.zip", filesDir)
+                }
+
+                runOnUiThread { tvStatus.text = "Loading offline routing engine..." }
+
+                // Initialize GraphHopper for mobile in-memory routing
+                val tmpHopper = GraphHopper().forMobile()
+                tmpHopper.load(graphFolder.absolutePath)
+
+                hopper = tmpHopper
+                isHopperReady = true
+
+                runOnUiThread {
+                    tvStatus.text = "Offline ready. Tap map to route."
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    tvStatus.text = "Routing init failed: ${e.message}"
+                    android.util.Log.e("GraphHopperOffline", "Init error", e)
+                }
+            }
+        }.start()
+    }
+
+    private fun setDestinationAndRoute(destination: LatLng) {
+        // Place pin marker
+        mapLibreMap?.getStyle { style ->
+            val destSource = style.getSourceAs<GeoJsonSource>(DEST_SOURCE_ID)
+            val pointFeature = Feature.fromGeometry(
+                Point.fromLngLat(destination.longitude, destination.latitude)
+            )
+            destSource?.setGeoJson(FeatureCollection.fromFeatures(arrayOf(pointFeature)))
+        }
+
+        // Get origin point
+        val lastLocation = mapLibreMap?.locationComponent?.lastKnownLocation
+        val origin = if (lastLocation != null) {
+            LatLng(lastLocation.latitude, lastLocation.longitude)
         } else {
-            Toast.makeText(this, "Enter a destination name", Toast.LENGTH_SHORT).show()
+            fallbackStart
+        }
+
+        calculateOfflineRoute(origin, destination)
+    }
+
+    private fun calculateOfflineRoute(from: LatLng, to: LatLng) {
+        if (!isHopperReady || hopper == null) {
+            Toast.makeText(this, "Routing engine is still loading...", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        tvStatus.text = "Routing..."
+
+        Thread {
+            try {
+                val req = GHRequest(
+                    GHPoint(from.latitude, from.longitude),
+                    GHPoint(to.latitude, to.longitude)
+                ).setVehicle("car")
+                    .setWeighting("fastest")
+
+                val rsp: GHResponse = hopper!!.route(req)
+
+                if (rsp.hasErrors()) {
+                    val err = rsp.errors.firstOrNull()?.message ?: "Route not found"
+                    runOnUiThread {
+                        tvStatus.text = "Route error: $err"
+                    }
+                    return@Thread
+                }
+
+                val path = rsp.best
+                val pointList = path.points
+                val distanceKm = path.distance / 1000.0
+                val timeMinutes = (path.time / 1000.0 / 60.0).toInt()
+
+                // Convert points to MapLibre LineString
+                val coordinates = ArrayList<Point>()
+                for (i in 0 until pointList.size()) {
+                    coordinates.add(Point.fromLngLat(pointList.getLon(i), pointList.getLat(i)))
+                }
+                val lineString = LineString.fromLngLats(coordinates)
+
+                runOnUiThread {
+                    tvStatus.text = "%.1f km · %d min (Offline)".format(distanceKm, timeMinutes)
+
+                    mapLibreMap?.getStyle { style ->
+                        val source = style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
+                        source?.setGeoJson(lineString)
+
+                        if (coordinates.isNotEmpty()) {
+                            val boundsBuilder = LatLngBounds.Builder()
+                            coordinates.forEach { pt ->
+                                boundsBuilder.include(LatLng(pt.latitude(), pt.longitude()))
+                            }
+                            mapLibreMap?.animateCamera(
+                                CameraUpdateFactory.newLatLngBounds(boundsBuilder.build(), 150)
+                            )
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    tvStatus.text = "Routing failed: ${e.message}"
+                }
+            }
+        }.start()
+    }
+
+    private fun unzipFromAssets(zipFileName: String, targetDir: File) {
+        assets.open(zipFileName).use { assetStream ->
+            ZipInputStream(assetStream).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    val outFile = File(targetDir, entry.name)
+                    if (entry.isDirectory) {
+                        outFile.mkdirs()
+                    } else {
+                        outFile.parentFile?.mkdirs()
+                        FileOutputStream(outFile).use { fos ->
+                            zis.copyTo(fos)
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
         }
     }
 
@@ -212,7 +341,6 @@ class MapActivity : ComponentActivity() {
     }
 
     private fun initLayers(style: Style) {
-        // 1. Route Polyline Layer
         if (style.getSource(ROUTE_SOURCE_ID) == null) {
             val emptyRoute = Feature.fromGeometry(LineString.fromLngLats(emptyList()))
             style.addSource(GeoJsonSource(ROUTE_SOURCE_ID, emptyRoute))
@@ -228,7 +356,6 @@ class MapActivity : ComponentActivity() {
             style.addLayer(lineLayer)
         }
 
-        // 2. Destination Marker Layer
         if (style.getSource(DEST_SOURCE_ID) == null) {
             style.addImage(DEST_ICON_ID, createPinBitmap())
             style.addSource(GeoJsonSource(DEST_SOURCE_ID, FeatureCollection.fromFeatures(emptyArray())))
@@ -245,154 +372,9 @@ class MapActivity : ComponentActivity() {
         }
     }
 
-    private fun setDestinationAndRoute(destination: LatLng, label: String) {
-        // Render destination pin
-        mapLibreMap?.getStyle { style ->
-            val destSource = style.getSourceAs<GeoJsonSource>(DEST_SOURCE_ID)
-            val pointFeature = Feature.fromGeometry(
-                Point.fromLngLat(destination.longitude, destination.latitude)
-            )
-            destSource?.setGeoJson(FeatureCollection.fromFeatures(arrayOf(pointFeature)))
-        }
-
-        // Get starting location (live GPS puck or fallback)
-        val lastLocation = mapLibreMap?.locationComponent?.lastKnownLocation
-        val origin = if (lastLocation != null) {
-            LatLng(lastLocation.latitude, lastLocation.longitude)
-        } else {
-            fallbackStart
-        }
-
-        tvStatus.text = "Routing to $label..."
-        fetchGraphHopperRoute(origin, destination)
-    }
-
-    private fun geocodeAndRoute(placeName: String) {
-        tvStatus.text = "Searching for \"$placeName\"..."
-        Thread {
-            try {
-                val origin = mapLibreMap?.locationComponent?.lastKnownLocation?.let {
-                    LatLng(it.latitude, it.longitude)
-                } ?: fallbackStart
-
-                // Photon Geocoder (OSM data, free, biased to Chennai)
-                val encodedQuery = URLEncoder.encode(placeName, "UTF-8")
-                val geocodeUrl = "https://photon.komoot.io/api/?q=$encodedQuery&lat=${origin.latitude}&lon=${origin.longitude}&limit=1"
-
-                val request = Request.Builder().url(geocodeUrl).build()
-                val response = httpClient.newCall(request).execute()
-                val body = response.body?.string() ?: return@Thread
-
-                val json = JSONObject(body)
-                val features = json.getJSONArray("features")
-
-                if (features.length() == 0) {
-                    runOnUiThread {
-                        tvStatus.text = "Location not found"
-                        Toast.makeText(this, "Could not find \"$placeName\"", Toast.LENGTH_SHORT).show()
-                    }
-                    return@Thread
-                }
-
-                val feature = features.getJSONObject(0)
-                val coords = feature.getJSONObject("geometry").getJSONArray("coordinates")
-                val foundLng = coords.getDouble(0)
-                val foundLat = coords.getDouble(1)
-                val foundName = feature.optJSONObject("properties")?.optString("name") ?: placeName
-
-                runOnUiThread {
-                    val destCoord = LatLng(foundLat, foundLng)
-                    setDestinationAndRoute(destCoord, foundName)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    tvStatus.text = "Search error"
-                    Toast.makeText(this, "Search error: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }.start()
-    }
-
-    private fun fetchGraphHopperRoute(from: LatLng, to: LatLng) {
-        Thread {
-            try {
-                // Replace with your valid API key from graphhopper.com
-                val apiKey = Secret.GRAPHHOPPER_API_KEY
-
-                val url = "https://graphhopper.com/api/1/route?" +
-                        "point=${from.latitude},${from.longitude}" +
-                        "&point=${to.latitude},${to.longitude}" +
-                        "&profile=car" +
-                        "&points_encoded=true" +
-                        "&key=$apiKey"
-
-                android.util.Log.d("GraphHopper", "Request: $url")
-
-                val request = Request.Builder().url(url).build()
-                val response = httpClient.newCall(request).execute()
-                val body = response.body?.string() ?: ""
-
-                android.util.Log.d("GraphHopper", "Code: ${response.code}, Response: $body")
-
-                val json = JSONObject(body)
-
-                // GraphHopper returns {"message": "..."} when a request fails
-                if (json.has("message")) {
-                    val errorMsg = json.getString("message")
-                    runOnUiThread {
-                        tvStatus.text = "API Error: $errorMsg"
-                        Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show()
-                    }
-                    return@Thread
-                }
-
-                val paths = json.optJSONArray("paths")
-                if (paths == null || paths.length() == 0) {
-                    runOnUiThread {
-                        tvStatus.text = "No route found between points"
-                    }
-                    return@Thread
-                }
-
-                val routeObj = paths.getJSONObject(0)
-                val encodedPoints = routeObj.getString("points")
-                val distanceKm = routeObj.getDouble("distance") / 1000.0
-                val timeMinutes = (routeObj.getDouble("time") / 1000.0 / 60.0).toInt()
-
-                val points = PolylineUtils.decode(encodedPoints, 5)
-                val lineString = LineString.fromLngLats(points)
-
-                runOnUiThread {
-                    tvStatus.text = "%.1f km · %d min".format(distanceKm, timeMinutes)
-
-                    mapLibreMap?.getStyle { style ->
-                        val source = style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
-                        source?.setGeoJson(lineString)
-
-                        if (points.isNotEmpty()) {
-                            val boundsBuilder = LatLngBounds.Builder()
-                            points.forEach { pt ->
-                                boundsBuilder.include(LatLng(pt.latitude(), pt.longitude()))
-                            }
-                            mapLibreMap?.animateCamera(
-                                CameraUpdateFactory.newLatLngBounds(boundsBuilder.build(), 150)
-                            )
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("GraphHopper", "Network error", e)
-                runOnUiThread {
-                    tvStatus.text = "Network/Routing error: ${e.message}"
-                    Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }.start()
-    }
-
     private fun clearRouteAndMarker() {
         etDestination.setText("")
-        tvStatus.text = "Tap map or search to route"
+        tvStatus.text = "Offline ready. Tap map to route."
 
         mapLibreMap?.getStyle { style ->
             val routeSource = style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
@@ -414,11 +396,9 @@ class MapActivity : ComponentActivity() {
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        // Red circular head
         paint.color = Color.parseColor("#E53935")
         canvas.drawCircle(size / 2f, size / 3.2f, size / 3.5f, paint)
 
-        // Needle tip pointing to ground
         val path = Path().apply {
             moveTo(size / 4f, size / 2.6f)
             lineTo(size * 3 / 4f, size / 2.6f)
@@ -427,7 +407,6 @@ class MapActivity : ComponentActivity() {
         }
         canvas.drawPath(path, paint)
 
-        // White inner circle
         paint.color = Color.WHITE
         canvas.drawCircle(size / 2f, size / 3.2f, size / 9f, paint)
 
@@ -442,6 +421,7 @@ class MapActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) { super.onSaveInstanceState(outState); mapView.onSaveInstanceState(outState) }
     override fun onDestroy() {
         mapView.onDestroy()
+        hopper?.close()
         tileServer?.stop()
         super.onDestroy()
     }
@@ -498,7 +478,6 @@ private class MbtilesServer(
             )
         }
 
-        // MBTiles stores rows in TMS schema; MapLibre requests standard XYZ
         val tmsY = tileCount - 1L - y
 
         val cursor = database.rawQuery(
