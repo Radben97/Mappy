@@ -1,0 +1,65 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="180dp"
+    android:height="320dp"
+    android:viewportWidth="360"
+    android:viewportHeight="640">
+
+    <!-- Terrain base -->
+    <path
+        android:fillColor="#E8ECEF"
+        android:pathData="M0,0h360v640h-360z" />
+
+    <!-- Park 1 -->
+    <path
+        android:fillColor="#C8E6C9"
+        android:pathData="M20,120 C80,100 160,180 130,280 C80,310 10,240 20,120 Z" />
+
+    <!-- Park 2 -->
+    <path
+        android:fillColor="#D4EDDA"
+        android:pathData="M210,380 C300,360 340,480 290,540 C220,570 170,480 210,380 Z" />
+
+    <!-- River/Water Body -->
+    <path
+        android:fillColor="#B3E5FC"
+        android:pathData="M260,0 C240,160 320,240 290,360 C270,440 330,560 310,640 L360,640 L360,0 Z" />
+
+    <!-- Secondary Roads (Street Grid) -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M0,64 H360 M0,128 H360 M0,192 H360 M0,256 H360 M0,320 H360 M0,384 H360 M0,448 H360 M0,512 H360 M0,576 H360" />
+
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M45,0 V640 M90,0 V640 M135,0 V640 M180,0 V640 M225,0 V640 M270,0 V640 M315,0 V640" />
+
+    <!-- Main Highway Horizontal -->
+    <path
+        android:strokeColor="#FFD54F"
+        android:strokeWidth="7"
+        android:pathData="M0,270 C100,250 220,360 360,330" />
+
+    <!-- Main Highway Vertical -->
+    <path
+        android:strokeColor="#FFD54F"
+        android:strokeWidth="6"
+        android:pathData="M160,0 C180,200 130,440 100,640" />
+
+    <!-- Center Pin Pulse Radar Effect -->
+    <path
+        android:fillColor="#221E88E5"
+        android:pathData="M180,320m-20,0a20,20 0,1 0,40 0a20,20 0,1 0,-40 0" />
+
+    <!-- Location Red Map Pin -->
+    <path
+        android:fillColor="#E53935"
+        android:pathData="M180,320 C165,300 165,280 180,280 C195,280 195,300 180,320 Z" />
+
+    <!-- Pin Inner Circle Dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M180,289m-4,0a4,4 0,1 0,8 0a4,4 0,1 0,-8 0" />
+
+</vector>
